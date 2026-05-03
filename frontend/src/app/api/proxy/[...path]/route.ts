@@ -2,12 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-export async function GET(request: NextRequest) {
-  const path = request.nextUrl.pathname.replace("/api/proxy", "");
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> }
+) {
+  const { path } = await params;
   const searchParams = request.nextUrl.search;
+  // Reconstruct backend path: /api/ + path array joined by /
+  const backendPath = `/api/${path.join("/")}`;
 
   try {
-    const response = await fetch(`${API_URL}${path}${searchParams}`, {
+    const response = await fetch(`${API_URL}${backendPath}${searchParams}`, {
       headers: {
         "Content-Type": "application/json",
       },
@@ -23,12 +28,16 @@ export async function GET(request: NextRequest) {
   }
 }
 
-export async function POST(request: NextRequest) {
-  const path = request.nextUrl.pathname.replace("/api/proxy", "");
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> }
+) {
+  const { path } = await params;
   const body = await request.json();
+  const backendPath = `/api/${path.join("/")}`;
 
   try {
-    const response = await fetch(`${API_URL}${path}`, {
+    const response = await fetch(`${API_URL}${backendPath}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

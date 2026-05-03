@@ -1,16 +1,32 @@
 import axios from "axios";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// In production (Vercel): use /api/proxy to avoid HTTPS→HTTP mixed content browser block.
+// The proxy strips /api/proxy and calls backend with /api/<path> — so we strip /api from paths.
+// In development (localhost): talk directly to localhost:8000 with full /api paths.
+const IS_PROD = process.env.NODE_ENV === "production";
+const BASE_URL = IS_PROD
+  ? "/api/proxy"
+  : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
+
+// Prefix to strip in production (proxy adds it back), keep full path in dev
+const PROXY_STRIP = IS_PROD ? "/api" : "";
+
+// Helper to build URL
+function url(path: string) {
+  return `${BASE_URL}${path.replace("/api", "")}`;
+}
 
 const api = axios.create({
-  baseURL: `${API_BASE_URL}`,
+  baseURL: BASE_URL,
   timeout: 15000,
   headers: {
     "Content-Type": "application/json",
   },
+  // In production, axios paths don't need /api prefix since baseURL = /api/proxy
+  // and we adjust individual calls below
 });
 
-// Response interceptor untuk error handling global
+// Response interceptor for error handling global
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
@@ -21,51 +37,51 @@ api.interceptors.response.use(
 
 // ==================== STOCKS ====================
 export const stocksApi = {
-  getList: () => api.get("/api/stocks/list"),
+  getList: () => api.get(`${PROXY_STRIP}/stocks/list`),
 
   getAllQuotes: (tickers?: string) =>
-    api.get("/api/stocks/quotes", { params: tickers ? { tickers } : {} }),
+    api.get(`${PROXY_STRIP}/stocks/quotes`, { params: tickers ? { tickers } : {} }),
 
   getQuote: (ticker: string) =>
-    api.get(`/api/stocks/${ticker}/quote`),
+    api.get(`${PROXY_STRIP}/stocks/${ticker}/quote`),
 
   getHistory: (ticker: string, period = "1y", interval = "1d") =>
-    api.get(`/api/stocks/${ticker}/history`, { params: { period, interval } }),
+    api.get(`${PROXY_STRIP}/stocks/${ticker}/history`, { params: { period, interval } }),
 
   getInfo: (ticker: string) =>
-    api.get(`/api/stocks/${ticker}/info`),
+    api.get(`${PROXY_STRIP}/stocks/${ticker}/info`),
 
   getFinancials: (ticker: string) =>
-    api.get(`/api/stocks/${ticker}/financials`),
+    api.get(`${PROXY_STRIP}/stocks/${ticker}/financials`),
 };
 
 // ==================== FOREX ====================
 export const forexApi = {
-  getPairs: () => api.get("/api/forex/pairs"),
+  getPairs: () => api.get(`${PROXY_STRIP}/forex/pairs`),
 
-  getAllRates: () => api.get("/api/forex/rates"),
+  getAllRates: () => api.get(`${PROXY_STRIP}/forex/rates`),
 
   getHistory: (pair: string, period = "1y", interval = "1d") =>
-    api.get("/api/forex/history", { params: { pair, period, interval } }),
+    api.get(`${PROXY_STRIP}/forex/history`, { params: { pair, period, interval } }),
 };
 
 // ==================== INDICES ====================
 export const indicesApi = {
-  getAll: () => api.get("/api/indices/"),
+  getAll: () => api.get(`${PROXY_STRIP}/indices/`),
 
   getHistory: (code: string, period = "1y", interval = "1d") =>
-    api.get(`/api/indices/${code}/history`, { params: { period, interval } }),
+    api.get(`${PROXY_STRIP}/indices/${code}/history`, { params: { period, interval } }),
 };
 
 // ==================== NEWS ====================
 export const newsApi = {
   getNews: (source = "all", limit = 20, goldFocus = true) =>
-    api.get("/api/news/", { params: { source, limit, gold_focus: goldFocus } }),
+    api.get(`${PROXY_STRIP}/news/`, { params: { source, limit, gold_focus: goldFocus } }),
 };
 
 // ==================== SCREENER ====================
 export const screenerApi = {
-  getSectors: () => api.get("/api/screener/sectors"),
+  getSectors: () => api.get(`${PROXY_STRIP}/screener/sectors`),
 
   screener: (params: {
     sector?: string;
@@ -75,22 +91,22 @@ export const screenerApi = {
     sort_by?: string;
     order?: string;
     limit?: number;
-  }) => api.get("/api/screener/", { params }),
+  }) => api.get(`${PROXY_STRIP}/screener/`, { params }),
 };
 
 // ==================== MACRO INDICATORS ====================
 export const macroApi = {
-  getSnapshot: () => api.get("/api/macro/snapshot"),
+  getSnapshot: () => api.get(`${PROXY_STRIP}/macro/snapshot`),
 
   getHistory: (seriesKey: string, period = "1mo", interval = "1d") =>
-    api.get(`/api/macro/history/${seriesKey}`, { params: { period, interval } }),
+    api.get(`${PROXY_STRIP}/macro/history/${seriesKey}`, { params: { period, interval } }),
 };
 
 // ==================== ECONOMIC CALENDAR ====================
 export const economicCalendarApi = {
-  getCalendar: () => api.get("/api/economic-calendar/calendar"),
+  getCalendar: () => api.get(`${PROXY_STRIP}/economic-calendar/calendar`),
 
-  getLatest: () => api.get("/api/economic-calendar/latest"),
+  getLatest: () => api.get(`${PROXY_STRIP}/economic-calendar/latest`),
 };
 
 export default api;

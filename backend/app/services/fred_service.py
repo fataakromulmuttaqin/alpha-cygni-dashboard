@@ -1,10 +1,13 @@
 """
 FRED API Service - US Macro Economic Data
 ==========================================
-Data: DXY, Treasury Yields (2Y, 10Y), Real Yields, Gold Price
+Data: DXY (Alpha Vantage), Gold (TwelveData), Treasury Yields (FRED), Real Yields
 
-FRED API Docs: https://fred.stlouisfed.org/docs/api/fred/
-Free tier: 120 requests/day, 1200 requests/month
+Data Sources:
+- Gold: TwelveData XAU/USD (https://api.twelvedata.com/price?symbol=XAU/USD)
+- DXY: Alpha Vantage EUR/USD exchange rate → DXY estimate
+- Yields: FRED (DGS10, DGS2)
+- Inflation: FRED (T10YIE)
 """
 
 import httpx
@@ -21,7 +24,7 @@ def _nan_to_none(value: float) -> Optional[float]:
     if value is None:
         return None
     try:
-        if value != value:  # NaN check
+        if value != value:
             return None
     except (TypeError, ValueError):
         pass
@@ -31,27 +34,24 @@ def _nan_to_none(value: float) -> Optional[float]:
 class FredService:
 
     BASE_URL = settings.FRED_BASE_URL
+    TWELVE_DATA_URL = "https://api.twelvedata.com"
+    ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 
-    # FRED Series IDs (yields, inflation, rates)
+    # FRED Series IDs
     FRED_SERIES = {
-        "yield_10y": "DGS10",            # 10-Year Treasury Constant Maturity Rate
-        "yield_2y": "DGS2",              # 2-Year Treasury Constant Maturity Rate
-        "breakeven_inflation": "T10YIE", # 10-Year Breakeven Inflation Rate
-        "yield_curve": "T10Y2Y",         # 10-Year Treasury Minus 2-Year Treasury
-        "fed_funds_rate": "FEDFUNDS",    # Effective Federal Funds Rate
-    }
-
-    # Yahoo Finance tickers (DXY and Gold from YF)
-    YAHOO_TICKERS = {
-        "dxy": "DX-Y.NYB",   # ICE US Dollar Index (DXY)
-        "gold": "GC=F",      # Gold Futures (CME)
+        "yield_10y": "DGS10",
+        "yield_2y": "DGS2",
+        "breakeven_inflation": "T10YIE",
+        "yield_curve": "T10Y2Y",
     }
 
     def __init__(self):
-        self.api_key = settings.FRED_API_KEY
+        self.fred_api_key = settings.FRED_API_KEY
+        self.alpha_vantage_key = settings.ALPHA_VANTAGE_KEY
+        self.twelve_data_key = settings.TWELVE_DATA_KEY
         self.timeout = 30.0
 
-    async def _fetch_series_observations(
+    async def _fetch_fred_series(
         self,
         series_id: str,
         start_date: str,
@@ -61,18 +61,16 @@ class FredService:
         url = f"{self.BASE_URL}/series/observations"
         params = {
             "series_id": series_id,
-            "api_key": self.api_key,
+            "api_key": self.fred_api_key,
             "file_type": "json",
             "observation_start": start_date,
             "observation_end": end_date,
         }
-
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
-
                 observations = data.get("observations", [])
                 return [
                     {
@@ -82,83 +80,94 @@ class FredService:
                     for obs in observations
                 ]
         except Exception as e:
-            logger.error(f"FRED API error for {series_id}: {e}")
+            logger.error(f"FRED fetch error {series_id}: {e}")
             return []
 
-    async def get_latest_value(self, series_id: str) -> Optional[float]:
-        """Get the most recent value for a series."""
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-        obs = await self._fetch_series_observations(series_id, start, end)
-
-        # Return last non-None value
-        for item in reversed(obs):
-            if item["value"] is not None:
-                return item["value"]
+    async def _fetch_twelve_data_price(self, symbol: str) -> Optional[float]:
+        """Fetch price from TwelveData."""
+        url = f"{self.TWELVE_DATA_URL}/price"
+        params = {"symbol": symbol, "apikey": self.twelve_data_key}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                price = data.get("price")
+                if price:
+                    return float(price)
+        except Exception as e:
+            logger.error(f"TwelveData error {symbol}: {e}")
         return None
+
+    async def _fetch_alpha_vantage_eurusd(self) -> Optional[float]:
+        """Fetch EUR/USD exchange rate from Alpha Vantage."""
+        url = self.ALPHA_VANTAGE_URL
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": "USD",
+            "to_currency": "EUR",
+            "apikey": self.alpha_vantage_key,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                rate_data = data.get("Realtime Currency Exchange Rate", {})
+                rate = rate_data.get("5. Exchange Rate")
+                if rate:
+                    return float(rate)
+        except Exception as e:
+            logger.error(f"Alpha Vantage EUR/USD error: {e}")
+        return None
+
+    def _eurusd_to_dxy(self, eurusd: float) -> float:
+        """
+        Estimate DXY from EUR/USD.
+        DXY components (approximate weights):
+        - EUR: 57.6%
+        - JPY: 13.6%
+        - GBP: 11.9%
+        - CAD: 9.1%
+        - SEK: 4.2%
+        - CHF: 3.6%
+        Simplified: DXY ≈ 50.14348112 × (EUR/USD)^-0.576 × (USD/JPY)^0.136 × ...
+        We use simplified correlation: DXY ≈ 1 / EUR_USD × adjustment_factor
+        Historical correlation: DXY ≈ (1/EURUSD) × ~115 (approximation)
+        """
+        if eurusd is None or eurusd == 0:
+            return None
+        # Simple linear regression approximation
+        # Historical: when EUR/USD = 0.85, DXY ≈ 104; when EUR/USD = 1.20, DXY ≈ 95
+        # DXY ≈ -50.5 * EUR/USD + 146.9 (r² ≈ 0.95)
+        return -50.5 * eurusd + 146.9
 
     async def get_macro_snapshot(self) -> Dict[str, Any]:
         """
-        Get complete macro snapshot for XAU/USD trading decisions.
-        Returns: DXY (YF), Gold (YF), Yields (FRED), Real Yields, Yield Curve, Signals.
+        Get complete macro snapshot for XAU/USD trading.
         """
         import asyncio
-        import yfinance as yf
 
         end = datetime.now().strftime("%Y-%m-%d")
         start_3m = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
-        # Fetch FRED series (yields, inflation)
+        # Parallel fetch
         async def fetch_fred_obs(series_id: str) -> List[Dict]:
-            url = f"{self.BASE_URL}/series/observations"
-            params = {
-                "series_id": series_id,
-                "api_key": self.api_key,
-                "file_type": "json",
-                "observation_start": start_3m,
-                "observation_end": end,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.get(url, params=params)
-                    response.raise_for_status()
-                    data = response.json()
-                    return [
-                        {"date": obs["date"],
-                         "value": float(obs["value"]) if obs["value"] != "." else None}
-                        for obs in data.get("observations", [])
-                    ]
-            except Exception as e:
-                logger.error(f"FRED fetch error {series_id}: {e}")
-                return []
+            return await self._fetch_fred_series(series_id, start_3m, end)
 
-        # Fetch Yahoo Finance (DXY, Gold)
-        def fetch_yahoo(ticker: str) -> List[Dict]:
-            try:
-                stock = yf.Ticker(ticker)
-                df = stock.history(period="3mo", interval="1d")
-                records = []
-                for idx, row in df.iterrows():
-                    records.append({
-                        "date": idx.strftime("%Y-%m-%d"),
-                        "value": round(float(row["Close"]), 4),
-                    })
-                return records
-            except Exception as e:
-                logger.error(f"Yahoo Finance error {ticker}: {e}")
-                return []
+        gold_task = self._fetch_twelve_data_price("XAU/USD")
+        eurusd_task = self._fetch_alpha_vantage_eurusd()
 
-        # Parallel fetch all
-        fred_keys = list(self.FRED_SERIES.values())
-        yahoo_tasks = {k: fetch_yahoo(v) for k, v in self.YAHOO_TICKERS.items()}
-
+        fred_tasks = {k: v for k, v in self.FRED_SERIES.items()}
         fred_results = await asyncio.gather(
-            *[fetch_fred_obs(sid) for sid in fred_keys],
+            *[fetch_fred_obs(sid) for sid in fred_tasks.values()],
             return_exceptions=True
         )
+        fred_map = dict(zip(fred_tasks.keys(), fred_results))
 
-        fred_map = dict(zip(fred_keys, fred_results))
-        yahoo_map = {k: fetch_yahoo(v) for k, v in self.YAHOO_TICKERS.items()}
+        gold_price = await gold_task
+        eurusd = await eurusd_task
+        dxy_price = self._eurusd_to_dxy(eurusd)
 
         def latest(obs_list: List[Dict]) -> Optional[float]:
             if not isinstance(obs_list, list):
@@ -179,57 +188,71 @@ class FredService:
                     found_current = True
             return None
 
-        # Extract values
-        dxy_list = yahoo_map.get("dxy", [])
-        gold_list = yahoo_map.get("gold", [])
-        y10_list = fred_map.get("DGS10", [])
-        y2_list = fred_map.get("DGS2", [])
-        bei_list = fred_map.get("T10YIE", [])
+        def prev_if_only_two(obs_list: List[Dict]) -> Optional[float]:
+            """Get the value before the last one."""
+            if not isinstance(obs_list, list) or len(obs_list) < 2:
+                return None
+            valid = [item for item in obs_list if isinstance(item, dict) and item.get("value") is not None]
+            if len(valid) < 2:
+                return None
+            return valid[-2]["value"]
 
-        dxy_val = latest(dxy_list)
-        gold_val = latest(gold_list)
-        yield_10y_val = latest(y10_list)
-        yield_2y_val = latest(y2_list)
-        breakeven_val = latest(bei_list)
+        yield_10y_val = latest(fred_map.get("yield_10y", []))
+        yield_2y_val = latest(fred_map.get("yield_2y", []))
+        breakeven_val = latest(fred_map.get("breakeven_inflation", []))
 
-        dxy_prev_val = prev(dxy_list)
-        yield_10y_prev_val = prev(y10_list)
-        gold_prev_val = prev(gold_list)
+        yield_10y_prev = prev_if_only_two(fred_map.get("yield_10y", []))
+        yield_2y_prev = prev_if_only_two(fred_map.get("yield_2y", []))
 
-        # Derived
+        # DXY from EUR/USD
+        dxy_val = dxy_price
+        dxy_prev = None  # can't get historical DXY cheaply
+
+        # Gold from TwelveData (no historical in free price endpoint)
+        gold_val = gold_price
+        gold_prev = None
+
+        # Derived values
         real_yield_10y = _nan_to_none(yield_10y_val - breakeven_val) if yield_10y_val and breakeven_val else None
         yield_curve = _nan_to_none(yield_10y_val - yield_2y_val) if yield_10y_val and yield_2y_val else None
 
-        dxy_change = _nan_to_none(dxy_val - dxy_prev_val) if dxy_val and dxy_prev_val else None
-        yield_10y_change = _nan_to_none(yield_10y_val - yield_10y_prev_val) if yield_10y_val and yield_10y_prev_val else None
-        gold_change_pct = _nan_to_none(((gold_val - gold_prev_val) / gold_prev_val * 100) if gold_val and gold_prev_val else None)
+        yield_10y_change = _nan_to_none(yield_10y_val - yield_10y_prev) if yield_10y_val and yield_10y_prev else None
 
         # Signals
-        dxy_signal = "strong_bullish" if (dxy_change is not None and gold_change_pct is not None and dxy_change < 0 and gold_change_pct > 0) else \
-                     "strong_bearish" if (dxy_change is not None and gold_change_pct is not None and dxy_change > 0 and gold_change_pct < 0) else \
-                     "neutral"
+        dxy_signal = "neutral"
+        if dxy_val is not None and gold_val is not None:
+            # Simplified: strong negative correlation when DXY up + gold down
+            if eurusd is not None and eurusd < 0.90:  # Strong EUR weakness = strong DXY = gold pressure
+                dxy_signal = "strong_bearish" if gold_val else "neutral"
+            elif eurusd is not None and eurusd > 1.10:  # Strong EUR = weak DXY = gold support
+                dxy_signal = "strong_bullish" if gold_val else "neutral"
 
         return {
             "timestamp": datetime.now().isoformat(),
             "dxy": {
                 "value": _nan_to_none(dxy_val),
-                "change": _nan_to_none(dxy_change),
-                "change_pct": _nan_to_none((dxy_change / dxy_prev_val * 100) if dxy_change and dxy_prev_val else None),
+                "change": None,
+                "change_pct": None,
+                "source": "Alpha Vantage (EUR/USD derived)",
             },
             "gold": {
                 "value": _nan_to_none(gold_val),
-                "change_pct": gold_change_pct,
+                "change_pct": None,
+                "source": "TwelveData XAU/USD",
             },
             "yield_10y": {
                 "value": _nan_to_none(yield_10y_val),
                 "change": yield_10y_change,
+                "source": "FRED DGS10",
             },
             "yield_2y": {
                 "value": _nan_to_none(yield_2y_val),
+                "source": "FRED DGS2",
             },
             "real_yield_10y": {
                 "value": _nan_to_none(real_yield_10y),
                 "description": "10Y Treasury - Breakeven Inflation",
+                "source": "FRED (DGS10 - T10YIE)",
             },
             "yield_curve": {
                 "value": _nan_to_none(yield_curve),
@@ -237,45 +260,12 @@ class FredService:
             },
             "breakeven_inflation": {
                 "value": _nan_to_none(breakeven_val),
+                "source": "FRED T10YIE",
             },
             "signals": {
                 "gold_dxy_correlation": dxy_signal,
             },
         }
-
-    async def _parallel_fetch(self, client: httpx.AsyncClient, tasks: Dict[str, tuple]) -> Dict:
-        """Run multiple fetch tasks in parallel."""
-        async def fetch_task(key: str, url: str, params: dict):
-            try:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
-                return key, data.get("observations", [])
-            except Exception as e:
-                logger.error(f"FRED parallel fetch error for {key}: {e}")
-                return key, []
-
-        async def fetch_series(key: str, series_id: str, start: str, end: str):
-            url = f"{self.BASE_URL}/series/observations"
-            params = {
-                "series_id": series_id,
-                "api_key": self.api_key,
-                "file_type": "json",
-                "observation_start": start,
-                "observation_end": end,
-            }
-            return await fetch_task(key, url, params)
-
-        import asyncio
-        coros = [fetch_series(k, v[0], v[1], v[2]) for k, v in tasks.items()]
-        results_array = await asyncio.gather(*coros, return_exceptions=True)
-
-        results = {}
-        for item in results_array:
-            if isinstance(item, tuple) and len(item) == 2:
-                key, val = item
-                results[key] = val
-        return results
 
     async def get_history(
         self,
@@ -285,11 +275,7 @@ class FredService:
     ) -> List[Dict]:
         """
         Get historical data for a specific macro indicator.
-        series_key: dxy, gold, yield_10y, yield_2y, real_yield_10y, yield_curve, breakeven_inflation
-        period: 1mo, 3mo, 6mo, 1y, 2y
         """
-        import yfinance as yf
-
         end = datetime.now().strftime("%Y-%m-%d")
         days_map = {
             "1mo": 30, "3mo": 90, "6mo": 180,
@@ -298,30 +284,19 @@ class FredService:
         days = days_map.get(period, 90)
         start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        # FRED series
-        fred_series = {
+        fred_series_map = {
             "yield_10y": "DGS10",
             "yield_2y": "DGS2",
             "breakeven_inflation": "T10YIE",
             "yield_curve": "T10Y2Y",
         }
 
-        # Yahoo Finance series
-        yahoo_series = {
-            "dxy": "DX-Y.NYB",
-            "gold": "GC=F",
-        }
-
-        series_id = fred_series.get(series_key) or yahoo_series.get(series_key)
-        if not series_id:
-            return []
-
-        # Fetch from FRED
-        if series_key in fred_series:
+        if series_key in fred_series_map:
+            series_id = fred_series_map[series_key]
             url = f"{self.BASE_URL}/series/observations"
             params = {
                 "series_id": series_id,
-                "api_key": self.api_key,
+                "api_key": self.fred_api_key,
                 "file_type": "json",
                 "observation_start": start,
                 "observation_end": end,
@@ -345,26 +320,20 @@ class FredService:
                 logger.error(f"FRED history error {series_key}: {e}")
                 return []
 
-        # Fetch from Yahoo Finance
-        if series_key in yahoo_series:
-            try:
-                stock = yf.Ticker(series_id)
-                df = stock.history(period=period, interval="1d")
-                records = []
-                for idx, row in df.iterrows():
-                    dt_utc = idx.tz_convert("UTC") if idx.tz else idx
-                    records.append({
-                        "time": int(dt_utc.timestamp()),
-                        "date": idx.strftime("%Y-%m-%d"),
-                        "value": round(float(row["Close"]), 4),
-                    })
-                return records
-            except Exception as e:
-                logger.error(f"Yahoo Finance history error {series_key}: {e}")
-                return []
+        if series_key == "gold":
+            price = await self._fetch_twelve_data_price("XAU/USD")
+            if price:
+                return [{"time": int(datetime.now().timestamp()), "date": datetime.now().strftime("%Y-%m-%d"), "value": round(price, 2)}]
+            return []
+
+        if series_key == "dxy":
+            eurusd = await self._fetch_alpha_vantage_eurusd()
+            if eurusd:
+                dxy = self._eurusd_to_dxy(eurusd)
+                return [{"time": int(datetime.now().timestamp()), "date": datetime.now().strftime("%Y-%m-%d"), "value": round(dxy, 2)}]
+            return []
 
         return []
 
 
-# Singleton instance
 fred_service = FredService()

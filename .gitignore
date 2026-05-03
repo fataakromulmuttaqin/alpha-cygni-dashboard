@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+backend/app/__pycache__
+frontend/.next
